@@ -2,12 +2,16 @@
 import fs from 'fs/promises';
 import mqtt from 'mqtt';
 import Trigger from '../Trigger';
+import * as registry from '../../../registry';
 import Hass from './Hass';
 import {
     registerContainerAdded,
     registerContainerUpdated,
 } from '../../../event';
 import { flatten } from '../../../model/container';
+import logger from '../../../log';
+import * as containerStore from '../../../store/container';
+const log = logger.child({ component: 'Mqtt' });
 
 const containerDefaultTopic = 'wud/container';
 const hassDefaultPrefix = 'homeassistant';
@@ -21,6 +25,14 @@ const hassDefaultPrefix = 'homeassistant';
 function getContainerTopic({ baseTopic, container }) {
     const containerName = container.name.replace(/\./g, '-');
     return `${baseTopic}/${container.watcher}/${containerName}`;
+}
+
+/**
+ * Return registered triggers.
+ * @returns {{id: string}[]}
+ */
+function getTriggers() {
+    return registry.getState().trigger;
 }
 
 /**
@@ -115,7 +127,6 @@ class Mqtt extends Trigger {
         options.rejectUnauthorized = this.configuration.tls.rejectunauthorized;
 
         this.client = await mqtt.connectAsync(this.configuration.url, options);
-
         if (this.configuration.hass.enabled) {
             this.hass = new Hass({
                 client: this.client,
@@ -123,8 +134,93 @@ class Mqtt extends Trigger {
                 log: this.log,
             });
         }
+        if (this.client) {
+            const updateTopic = `${this.configuration.topic}/local/update/#`;
+            this.client.subscribe(updateTopic, (err) => {
+                if (!err) {
+                    log.info(`Подписка на топик "${updateTopic}" оформлена`);
+                } else {
+                    log.error('Ошибка при подписке:', err);
+                }
+            });
+
+            this.client.on('message', (receivedTopic, message) => {
+                this.handleMessage(receivedTopic, message);
+            });
+        }
         registerContainerAdded((container) => this.trigger(container));
         registerContainerUpdated((container) => this.trigger(container));
+    }
+
+    private handleMessage(receivedTopic: string, message: Buffer): void {
+        const containerNameToUpdate = receivedTopic.split('/').at(-1);
+        const isUpdate = message.toString();
+
+        log.info(
+            `Получено уведомление об обновлении [${containerNameToUpdate}]: ${isUpdate}`,
+        );
+
+        if (isUpdate) {
+            this.executeTrigger({
+                containerName: containerNameToUpdate,
+                hass: this.hass,
+            });
+        }
+    }
+
+    async executeTrigger({ containerName, hass }) {
+        const triggerType = 'dockercompose';
+        const triggerName = 'app';
+        log.info(
+            `Ищу контейнер с именем ${containerName}. Список контейнеров:`,
+        );
+        containerStore
+            .getContainers({})
+            .forEach((container) => log.info(container.name));
+        const containersToTrigger = containerStore.getContainers({
+            name: containerName,
+        });
+        log.info(containersToTrigger);
+        if (containersToTrigger) {
+            log.info(containersToTrigger);
+            const containerToTrigger = containersToTrigger[0];
+            log.info(containerToTrigger);
+            const triggerToRun = getTriggers()[`${triggerType}.${triggerName}`];
+            if (triggerToRun) {
+                try {
+                    if (hass) {
+                        this.setInstallInProgress(containerToTrigger);
+                    }
+                    await triggerToRun.trigger(containerToTrigger);
+                    log.info(
+                        `Trigger executed with success (type=${triggerType}, name=${triggerName}, container=${JSON.stringify(containerToTrigger)})`,
+                    );
+                } catch (e) {
+                    log.warn(
+                        `Error when running trigger ${triggerType}.${triggerName} (${e.message})`,
+                    );
+                }
+            }
+        }
+    }
+
+    async setInstallInProgress(container) {
+        log.info(container);
+        const containerTopic = getContainerTopic({
+            baseTopic: this.configuration.topic,
+            container,
+        });
+        this.log.debug(`Статус установки в HA ${containerTopic}`);
+        await this.client.publish(
+            containerTopic,
+            JSON.stringify({
+                ...flatten(container),
+                in_progress: true,
+            }),
+            {
+                retain: true,
+            },
+        );
     }
 
     /**

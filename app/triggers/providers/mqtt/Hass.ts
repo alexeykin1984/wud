@@ -87,33 +87,10 @@ class Hass {
      * @returns {Promise<void>}
      */
     async addContainerSensor(container) {
-        const containerStateSensor = {
-            kind: 'update',
-            topic: this.getContainerStateTopic({ container }),
-        };
-        this.log.info(
-            `Add hass container update sensor [${containerStateSensor.topic}]`,
-        );
         if (this.configuration.hass.discovery) {
-            await this.publishDiscoveryMessage({
-                discoveryTopic: this.getDiscoveryTopic({
-                    kind: containerStateSensor.kind,
-                    topic: containerStateSensor.topic,
-                }),
-                kind: containerStateSensor.kind,
-                stateTopic: containerStateSensor.topic,
-                name: container.displayName,
-                icon: sanitizeIcon(container.displayIcon),
-                options: {
-                    force_update: true,
-                    value_template: HASS_ENTITY_VALUE_TEMPLATE,
-                    latest_version_topic: containerStateSensor.topic,
-                    latest_version_template: HASS_LATEST_VERSION_TEMPLATE,
-                    release_url: container.result
-                        ? container.result.link
-                        : undefined,
-                    json_attributes_topic: containerStateSensor.topic,
-                },
+            await this.publishUpdateMessage({
+                container,
+                options: {},
             });
         }
         await this.updateContainerSensors(container);
@@ -330,6 +307,40 @@ class Hass {
         });
     }
 
+    async publishUpdateMessage({ container, options = {} }) {
+        const containerStateSensor = {
+            kind: 'update',
+            topic: this.getContainerStateTopic({ container }),
+            updateTopic: this.getContainerUpdateTopic({ container }),
+        };
+        this.log.info(
+            `Add/update hass container update sensor [${containerStateSensor.topic}]`,
+        );
+        return this.publishDiscoveryMessage({
+            discoveryTopic: this.getDiscoveryTopic({
+                kind: containerStateSensor.kind,
+                topic: containerStateSensor.topic,
+            }),
+            kind: containerStateSensor.kind,
+            stateTopic: containerStateSensor.topic,
+            name: container.displayName,
+            icon: sanitizeIcon(container.displayIcon),
+            options: {
+                force_update: true,
+                value_template: HASS_ENTITY_VALUE_TEMPLATE,
+                latest_version_topic: containerStateSensor.topic,
+                latest_version_template: HASS_LATEST_VERSION_TEMPLATE,
+                release_url: container.result
+                    ? container.result.link
+                    : undefined,
+                json_attributes_topic: containerStateSensor.topic,
+                command_topic: containerStateSensor.updateTopic,
+                payload_install: true,
+                ...options,
+            },
+        });
+    }
+
     /**
      * Publish a discovery message.
      * @param discoveryTopic
@@ -394,6 +405,16 @@ class Hass {
     getContainerStateTopic({ container }) {
         const containerName = container.name.replace(/\./g, '-');
         return `${this.configuration.topic}/${container.watcher}/${containerName}`;
+    }
+
+    /**
+     * Get container update topic.
+     * @param container
+     * @return {string}
+     */
+    getContainerUpdateTopic({ container }) {
+        const containerName = container.name.replace(/\./g, '-');
+        return `${this.configuration.topic}/${container.watcher}/update/${containerName}`;
     }
 
     /**
