@@ -120,6 +120,53 @@ To avoid this entity explosion while still getting full visibility into availabl
 - **Global Sensors Kept**: The global connection status (`binary_sensor.wud_connection_status`), total container count (`sensor.wud_total_count`), total update count (`sensor.wud_total_update_count`), and update status (`binary_sensor.wud_total_update_status`) continue to be discovered and updated.
 - **Skipped & Cleaned Up Entities**: Per-container `update` entities and per-watcher devices/sensors are omitted. If switching from `all` to `summary` mode, their discovery topics are automatically deleted.
 
+### 📝 Release Notes (Release Summary)
+
+By default, the Home Assistant `update` entities only link to the release notes (when a [`wud.link.template` label](../../watchers/labels.md) is set). Set `WUD_TRIGGER_MQTT_{trigger_name}_HASS_RELEASE_SUMMARY=true` to let WUD fetch the notes of the new version from [GitHub Releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) and publish them as the `release_summary` of the entity, so that Home Assistant shows what changed right in the update dialog.
+
+<Tabs>
+<TabItem value="docker-compose" label="Docker Compose">
+
+```yaml
+services:
+  whatsupdocker:
+    image: getwud/wud
+    environment:
+      - WUD_TRIGGER_MQTT_HASS_URL=mqtt://homeassistant.local:1883
+      - WUD_TRIGGER_MQTT_HASS_HASS_ENABLED=true
+      - WUD_TRIGGER_MQTT_HASS_HASS_RELEASE_SUMMARY=true
+      # Optional but recommended (see the rate limit below)
+      - WUD_TRIGGER_MQTT_HASS_HASS_GITHUB_TOKEN=github_pat_xxxxxxxxxxxx
+```
+
+</TabItem>
+<TabItem value="docker" label="Docker">
+
+```bash
+docker run \
+  -e WUD_TRIGGER_MQTT_HASS_URL="mqtt://homeassistant.local:1883" \
+  -e WUD_TRIGGER_MQTT_HASS_HASS_ENABLED="true" \
+  -e WUD_TRIGGER_MQTT_HASS_HASS_RELEASE_SUMMARY="true" \
+  -e WUD_TRIGGER_MQTT_HASS_HASS_GITHUB_TOKEN="github_pat_xxxxxxxxxxxx" \
+  getwud/wud
+```
+
+</TabItem>
+</Tabs>
+
+- **Where it is published**: as `release_summary` in the discovery configuration of the container `update` entity (next to `release_url`), and as a top-level `release_summary` key in the container state payload (`{topic}/{watcher}/{container}`). The key is simply omitted when no release notes are available. In [summary mode](#-summary-mode-lite-integration) there is no per-container entity, so only the state payload carries it.
+- **Tag updates only**: the summary is fetched when a new tag is available. Digest-only updates have no matching release and never trigger a GitHub call.
+- **255 characters limit**: Home Assistant limits `release_summary` to 255 characters. The release notes are trimmed and, when longer, cut to 254 characters followed by `…`. The markdown is otherwise left untouched; use the release link to read the full notes.
+- **How the GitHub repository is detected** (first match wins):
+  1. the `org.opencontainers.image.source` label of the container/image when it points to `github.com/{owner}/{repo}`;
+  2. the release link of the container (the [`wud.link.template` label](../../watchers/labels.md)) when it points to `github.com/{owner}/{repo}/...`;
+  3. the image name when the image is hosted on `ghcr.io` and is named `{owner}/{repo}`.
+
+  When no repository can be detected, no summary is published.
+- **Release lookup**: WUD looks for the GitHub release whose tag is the new image tag and, if there is none, retries once with the `v` prefix added or removed (`1.2.3` ↔ `v1.2.3`). The release description is used, falling back to the release title when the description is empty.
+- **Rate limit & token**: anonymous calls to the GitHub API are limited to 60 requests per hour and per IP address. Results are cached in memory (24 hours for a release found, 6 hours when there is none) to stay well below it, but on larger setups you should set `WUD_TRIGGER_MQTT_{trigger_name}_HASS_GITHUB_TOKEN` to a [GitHub personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) (no scope/permission is needed for public repositories) to raise the limit to 5000 requests per hour. The token is also what gives access to the releases of private repositories.
+- **Failures are harmless**: when GitHub is unreachable, rate limited or rejects the token, WUD logs a warning, publishes the usual messages without `release_summary` and retries 5 minutes later.
+
 ### 🔐 MQTT Permissions & Broker ACLs
 
 When using an MQTT broker with Access Control Lists (ACLs) enabled (e.g. Mosquitto):
@@ -158,6 +205,21 @@ Here are the variables specifically relevant to Home Assistant:
     type="string"
     defaultValue="all">
     Discovery entities mode (<code>all</code> or <code>summary</code>). In <code>all</code> mode (default), discovers individual container update entities and per-watcher devices/sensors. In <code>summary</code> mode, discovers a single summary sensor (<code>sensor.wud_updates</code>) with pending updates list in attributes, plus global counts/status.
+  </ConfigOption>
+
+  <ConfigOption
+    name="WUD_TRIGGER_MQTT_{trigger_name}_HASS_RELEASE_SUMMARY"
+    required={false}
+    type="boolean"
+    defaultValue="false">
+    Fetch the GitHub release notes of the new version and publish them (limited to 255 characters) as the <code>release_summary</code> of the update entities. Requires <code>HASS_ENABLED=true</code>. See <a href="#-release-notes-release-summary">Release Notes</a>.
+  </ConfigOption>
+
+  <ConfigOption
+    name="WUD_TRIGGER_MQTT_{trigger_name}_HASS_GITHUB_TOKEN"
+    required={false}
+    type="string">
+    GitHub token used to fetch the release notes (raises the GitHub API rate limit from 60 to 5000 requests per hour). Only used when <code>HASS_RELEASE_SUMMARY=true</code>.
   </ConfigOption>
 
   <ConfigOption

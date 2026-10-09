@@ -3,6 +3,11 @@ import log from '../../../log';
 import Hass from './Hass';
 import * as containerStore from '../../../store/container';
 import * as registry from '../../../registry';
+import axios from 'axios';
+import { flatten } from '../../../model/container';
+import { clearReleaseSummaryCache, getReleaseSummary } from './GithubRelease';
+
+jest.mock('axios');
 
 jest.mock('../../../configuration', () => ({
     ...jest.requireActual('../../../configuration'),
@@ -1056,5 +1061,292 @@ describe('discovery_entities: summary', () => {
             ([, payload]) => payload !== '',
         );
         expect(nonDeleteCalls).toHaveLength(0);
+    });
+});
+
+describe('release summary', () => {
+    const releaseContainer = {
+        id: 'container-id',
+        name: 'container-name',
+        displayName: 'My container',
+        displayIcon: 'mdi:docker',
+        watcher: 'watcher-name',
+        updateAvailable: true,
+        updateKind: { kind: 'tag', localValue: '1.0.0', remoteValue: '1.1.0' },
+        labels: {
+            'org.opencontainers.image.source': 'https://github.com/owner/repo',
+        },
+        image: {
+            registry: { url: 'https://ghcr.io/v2' },
+            name: 'owner/repo',
+            tag: { value: '1.0.0', semver: true },
+        },
+        result: {
+            tag: '1.1.0',
+            link: 'https://github.com/owner/repo/releases/tag/1.1.0',
+        },
+    };
+    const discoveryTopic =
+        'homeassistant/update/topic_watcher-name_container-name/config';
+    const stateTopic = 'topic/watcher-name/container-name';
+
+    function getPublished(topic) {
+        return mqttClientMock.publish.mock.calls
+            .filter(([publishedTopic]) => publishedTopic === topic)
+            .map(([, payload]) => payload);
+    }
+
+    function enableReleaseSummary(hassOverrides = {}) {
+        hass.configuration.hass = {
+            ...hass.configuration.hass,
+            enabled: true,
+            release_summary: true,
+            ...hassOverrides,
+        };
+    }
+
+    beforeEach(() => {
+        clearReleaseSummaryCache();
+        axios.get = jest.fn().mockResolvedValue({
+            status: 200,
+            data: { body: '## Changes\n- fix' },
+            headers: {},
+        });
+        mqttClientMock.publish.mockClear();
+    });
+
+    test.each([
+        [{}],
+        [{ enabled: true }],
+        [{ enabled: true, release_summary: false, github_token: 'token' }],
+        [{ enabled: false, release_summary: true }],
+    ])(
+        'addContainerSensor must not call GitHub nor publish a release summary when hass options are %j',
+        async (hassOverrides) => {
+            hass.configuration.hass = {
+                ...hass.configuration.hass,
+                ...hassOverrides,
+            };
+            await hass.addContainerSensor(releaseContainer);
+            expect(axios.get).not.toHaveBeenCalled();
+            const [discovery] = getPublished(discoveryTopic);
+            expect(discovery).not.toContain('release_summary');
+            expect(Object.keys(JSON.parse(discovery)).slice(-3)).toEqual([
+                'in_progress_template',
+                'release_url',
+                'json_attributes_topic',
+            ]);
+        },
+    );
+
+    test('addContainerSensor must publish synchronously when the release summary is disabled', () => {
+        hass.addContainerSensor(releaseContainer);
+        expect(getPublished(discoveryTopic)).toHaveLength(1);
+    });
+
+    test('addContainerSensor must publish the release summary next to the release url when enabled', async () => {
+        enableReleaseSummary({ github_token: 'ghp_secret' });
+        await hass.addContainerSensor(releaseContainer);
+        expect(axios.get).toHaveBeenCalledTimes(1);
+        expect(axios.get).toHaveBeenCalledWith(
+            'https://api.github.com/repos/owner/repo/releases/tags/1.1.0',
+            expect.objectContaining({
+                headers: expect.objectContaining({
+                    Authorization: 'Bearer ghp_secret',
+                }),
+            }),
+        );
+        const discovery = JSON.parse(getPublished(discoveryTopic)[0]);
+        expect(discovery.release_url).toBe(
+            'https://github.com/owner/repo/releases/tag/1.1.0',
+        );
+        expect(discovery.release_summary).toBe('## Changes\n- fix');
+        expect(Object.keys(discovery).slice(-3)).toEqual([
+            'release_url',
+            'release_summary',
+            'json_attributes_topic',
+        ]);
+    });
+
+    test.each([
+        [
+            'GitHub is unreachable',
+            () => axios.get.mockRejectedValue(new Error('ECONNREFUSED')),
+            releaseContainer,
+        ],
+        [
+            'the release does not exist',
+            () =>
+                axios.get.mockResolvedValue({
+                    status: 404,
+                    data: {},
+                    headers: {},
+                }),
+            releaseContainer,
+        ],
+        [
+            'the update is a digest update',
+            () => undefined,
+            { ...releaseContainer, updateKind: { kind: 'digest' } },
+        ],
+    ])(
+        'addContainerSensor must omit the release summary when %s',
+        async (_label, mockGithub, container) => {
+            mockGithub();
+            enableReleaseSummary();
+            hass.log = { info: jest.fn(), debug: jest.fn(), warn: jest.fn() };
+            await hass.addContainerSensor(container);
+            const discoveries = getPublished(discoveryTopic);
+            expect(discoveries).toHaveLength(1);
+            expect(discoveries[0]).not.toContain('release_summary');
+            expect(JSON.parse(discoveries[0]).json_attributes_topic).toBe(
+                stateTopic,
+            );
+        },
+    );
+
+    test('addContainerSensor must not call GitHub when discovery is disabled', async () => {
+        enableReleaseSummary({ discovery: false });
+        await hass.addContainerSensor(releaseContainer);
+        expect(axios.get).not.toHaveBeenCalled();
+        expect(mqttClientMock.publish).not.toHaveBeenCalled();
+    });
+
+    test('addContainerSensor must not call GitHub in summary mode', async () => {
+        enableReleaseSummary({ discovery_entities: 'summary' });
+        jest.spyOn(containerStore, 'getContainers').mockReturnValue([]);
+        await hass.addContainerSensor(releaseContainer);
+        expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    test('removeContainerSensor must be published after the discovery still waiting for GitHub', async () => {
+        enableReleaseSummary();
+        let resolveRelease;
+        axios.get.mockReturnValue(
+            new Promise((resolve) => {
+                resolveRelease = () =>
+                    resolve({
+                        status: 200,
+                        data: { body: 'notes' },
+                        headers: {},
+                    });
+            }),
+        );
+        const added = hass.addContainerSensor(releaseContainer);
+        const removed = hass.removeContainerSensor(releaseContainer);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(mqttClientMock.publish).not.toHaveBeenCalled();
+
+        resolveRelease();
+        await Promise.all([added, removed]);
+        expect(
+            mqttClientMock.publish.mock.calls.map(([topic, payload]) => [
+                topic,
+                payload === '' ? 'removed' : 'published',
+            ]),
+        ).toEqual([
+            [discoveryTopic, 'published'],
+            [stateTopic, 'removed'],
+            [discoveryTopic, 'removed'],
+        ]);
+    });
+
+    test('removeContainerSensor must publish synchronously when the release summary is disabled', () => {
+        hass.removeContainerSensor(releaseContainer);
+        expect(getPublished(stateTopic)).toEqual(['']);
+    });
+
+    describe('handleInstallCommand', () => {
+        beforeEach(() => {
+            jest.spyOn(containerStore, 'getContainers').mockReturnValue([
+                releaseContainer,
+            ]);
+            jest.spyOn(containerStore, 'getContainer').mockReturnValue(
+                releaseContainer,
+            );
+            registry.getState().trigger = {
+                docker: {
+                    type: 'docker',
+                    trigger: jest.fn().mockResolvedValue(undefined),
+                },
+            };
+        });
+
+        test('must publish unchanged payloads when the release summary is disabled', async () => {
+            // Even when a summary is already cached by another trigger
+            await getReleaseSummary(releaseContainer);
+            axios.get.mockClear();
+
+            await hass.handleInstallCommand(`${stateTopic}/install`);
+            expect(axios.get).not.toHaveBeenCalled();
+            expect(getPublished(stateTopic)).toEqual([
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    in_progress: true,
+                }),
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    in_progress: false,
+                }),
+            ]);
+        });
+
+        test('must publish in_progress without waiting for GitHub when the summary is not cached', async () => {
+            enableReleaseSummary();
+            await hass.handleInstallCommand(`${stateTopic}/install`);
+            expect(axios.get).not.toHaveBeenCalled();
+            expect(getPublished(stateTopic)).toEqual([
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    in_progress: true,
+                }),
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    in_progress: false,
+                }),
+            ]);
+        });
+
+        test('must publish the cached release summary in both state payloads', async () => {
+            enableReleaseSummary();
+            await hass.addContainerSensor(releaseContainer);
+            axios.get.mockClear();
+
+            await hass.handleInstallCommand(`${stateTopic}/install`);
+            expect(axios.get).not.toHaveBeenCalled();
+            expect(getPublished(stateTopic)).toEqual([
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    release_summary: '## Changes\n- fix',
+                    in_progress: true,
+                }),
+                JSON.stringify({
+                    ...flatten(releaseContainer),
+                    release_summary: '## Changes\n- fix',
+                    in_progress: false,
+                }),
+            ]);
+        });
+
+        test('must drop the release summary once the container is up to date', async () => {
+            enableReleaseSummary();
+            await hass.addContainerSensor(releaseContainer);
+            const updatedContainer = {
+                ...releaseContainer,
+                updateAvailable: false,
+                updateKind: { kind: 'unknown' },
+            };
+            containerStore.getContainer.mockReturnValue(updatedContainer);
+
+            await hass.handleInstallCommand(`${stateTopic}/install`);
+            const states = getPublished(stateTopic);
+            expect(states[0]).toContain('"release_summary"');
+            expect(states[1]).toBe(
+                JSON.stringify({
+                    ...flatten(updatedContainer),
+                    in_progress: false,
+                }),
+            );
+        });
     });
 });

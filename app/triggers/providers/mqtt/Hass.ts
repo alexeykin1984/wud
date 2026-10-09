@@ -19,6 +19,12 @@ import Watcher from '../../../watchers/Watcher';
 import { MqqtConfiguration as MqttConfiguration } from './Mqtt';
 import { Logger } from 'pino';
 import { isOneshot } from '../../../runtime/mode';
+import {
+    getCachedHassReleaseSummary,
+    getReleaseSummary,
+    isReleaseSummaryEnabled,
+    whenReleaseSummariesSettled,
+} from './GithubRelease';
 
 const HASS_MANUFACTURER = 'wud';
 const HASS_ENTITY_VALUE_TEMPLATE = '{{ value_json.image_tag_value }}';
@@ -292,6 +298,16 @@ class Hass {
             `Add hass container update sensor [${containerStateSensor.topic}]`,
         );
         if (this.configuration.hass.discovery) {
+            // Only wait for GitHub when the release summary is enabled so that
+            // the default behaviour (and its timing) stays strictly unchanged.
+            const releaseSummary = isReleaseSummaryEnabled(
+                this.configuration.hass,
+            )
+                ? await getReleaseSummary(container, {
+                      token: this.configuration.hass.github_token,
+                      log: this.log,
+                  })
+                : undefined;
             await this.publishDiscoveryMessage({
                 discoveryTopic: this.getDiscoveryTopic(containerStateSensor),
                 kind: containerStateSensor.kind,
@@ -318,6 +334,7 @@ class Hass {
                     release_url: container.result
                         ? container.result.link
                         : undefined,
+                    release_summary: releaseSummary,
                     json_attributes_topic: containerStateSensor.topic,
                 },
             });
@@ -332,6 +349,11 @@ class Hass {
             kind: 'update',
             topic: this.getContainerStateTopic({ container }),
         };
+        // Messages still waiting for a release summary must be published
+        // first, otherwise they would resurrect the removed container.
+        if (isReleaseSummaryEnabled(this.configuration.hass)) {
+            await whenReleaseSummariesSettled();
+        }
         this.log.info(
             `Remove hass container update sensor [${containerStateSensor.topic}]`,
         );
@@ -698,7 +720,15 @@ class Hass {
         try {
             await this.client.publish(
                 stateTopic,
-                JSON.stringify({ ...flatten(container), in_progress: true }),
+                JSON.stringify({
+                    ...flatten(container),
+                    // Cache only: `in_progress` must not wait for GitHub
+                    release_summary: getCachedHassReleaseSummary(
+                        this.configuration.hass,
+                        container,
+                    ),
+                    in_progress: true,
+                }),
                 { retain: true },
             );
             // Only fire triggers actually associated with this container
@@ -748,6 +778,10 @@ class Hass {
                 stateTopic,
                 JSON.stringify({
                     ...flatten(currentContainer),
+                    release_summary: getCachedHassReleaseSummary(
+                        this.configuration.hass,
+                        currentContainer,
+                    ),
                     in_progress: false,
                 }),
                 { retain: true },
