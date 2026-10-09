@@ -95,6 +95,10 @@ If you are looking to integrate WUD with Home Assistant via MQTT Auto-Discovery 
 This trigger supports all [common trigger configuration options](../README.md#common-trigger-configuration) and runs in `simple` mode by default.
 :::
 
+:::tip[Release notes in Home Assistant]
+Set `WUD_TRIGGER_MQTT_{trigger_name}_HASS_RELEASE_SUMMARY=true` (and optionally `WUD_TRIGGER_MQTT_{trigger_name}_HASS_GITHUB_TOKEN`) to publish the GitHub release notes of the new version as the `release_summary` of the Home Assistant update entities. See the [Home Assistant (MQTT) Guide](../homeassistant-mqtt/README.md#-release-notes-release-summary).
+:::
+
 :::tip[Customizing Entity Names & Icons in Home Assistant]
 You can customize how containers display in Home Assistant using the [`wud.display.name` and `wud.display.icon` labels](../../watchers/labels.md#7-customize-display-name--icon).
 :::

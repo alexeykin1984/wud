@@ -8,6 +8,7 @@ import {
 } from '../../../event';
 import { Container, flatten } from '../../../model/container';
 import { isOneshot } from '../../../runtime/mode';
+import { isReleaseSummaryEnabled, getReleaseSummary } from './GithubRelease';
 
 const containerDefaultTopic = 'wud/container';
 const hassDefaultPrefix = 'homeassistant';
@@ -23,6 +24,49 @@ function getContainerTopic({ baseTopic, container }) {
     return `${baseTopic}/${container.watcher}/${containerName}`;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Environment variables are split on every underscore, so
+ * `..._HASS_RELEASE_SUMMARY` and `..._HASS_GITHUB_TOKEN` are received as
+ * `hass.release.summary` and `hass.github.token`.
+ * Fold them back to the `hass.release_summary` and `hass.github_token` keys.
+ */
+function normalizeHassConfiguration<T>(configuration: T): T {
+    if (!isPlainObject(configuration) || !isPlainObject(configuration.hass)) {
+        return configuration;
+    }
+    const { release, github, ...hass } = configuration.hass;
+    if (!isPlainObject(release) && !isPlainObject(github)) {
+        return configuration;
+    }
+    if (isPlainObject(release)) {
+        const { summary, ...releaseOthers } = release;
+        if (summary !== undefined && hass.release_summary === undefined) {
+            hass.release_summary = summary;
+        }
+        if (Object.keys(releaseOthers).length > 0) {
+            hass.release = releaseOthers;
+        }
+    } else if (release !== undefined) {
+        hass.release = release;
+    }
+    if (isPlainObject(github)) {
+        const { token, ...githubOthers } = github;
+        if (token !== undefined && hass.github_token === undefined) {
+            hass.github_token = token;
+        }
+        if (Object.keys(githubOthers).length > 0) {
+            hass.github = githubOthers;
+        }
+    } else if (github !== undefined) {
+        hass.github = github;
+    }
+    return { ...configuration, hass };
+}
+
 export interface MqqtConfiguration extends TriggerConfiguration {
     url: string;
     topic: string;
@@ -36,6 +80,8 @@ export interface MqqtConfiguration extends TriggerConfiguration {
         discovery_entities: 'all' | 'summary';
         deviceid: string;
         devicename: string;
+        release_summary: boolean;
+        github_token?: string;
     };
     tls: {
         clientkey: string;
@@ -81,6 +127,8 @@ class Mqtt extends Trigger {
                         .default('all'),
                     deviceid: this.joi.string().default('wud'),
                     devicename: this.joi.string().default('wud'),
+                    release_summary: this.joi.boolean().default(false),
+                    github_token: this.joi.string(),
                 })
                 .default({
                     enabled: false,
@@ -89,6 +137,7 @@ class Mqtt extends Trigger {
                     discovery_entities: 'all',
                     deviceid: 'wud',
                     devicename: 'wud',
+                    release_summary: false,
                 }),
             tls: this.joi
                 .object({
@@ -109,6 +158,17 @@ class Mqtt extends Trigger {
     declare configuration: MqqtConfiguration;
 
     /**
+     * Validate the configuration (accepting the env var form of the hass keys).
+     */
+    validateConfiguration(
+        configuration: TriggerConfiguration,
+    ): TriggerConfiguration {
+        return super.validateConfiguration(
+            normalizeHassConfiguration(configuration),
+        );
+    }
+
+    /**
      * Sanitize sensitive data
      * @returns {*}
      */
@@ -119,7 +179,14 @@ class Mqtt extends Trigger {
             topic: this.configuration.topic,
             user: this.configuration.user,
             password: Mqtt.mask(this.configuration.password),
-            hass: this.configuration.hass,
+            hass: this.configuration.hass?.github_token
+                ? {
+                      ...this.configuration.hass,
+                      github_token: Mqtt.mask(
+                          this.configuration.hass.github_token,
+                      ),
+                  }
+                : this.configuration.hass,
         };
     }
 
@@ -223,11 +290,24 @@ class Mqtt extends Trigger {
             container,
         });
 
+        // Only wait for GitHub when the release summary is enabled so that the
+        // default behaviour (and its timing) stays strictly unchanged.
+        const { hass } = this.configuration;
+        const releaseSummary = isReleaseSummaryEnabled(hass)
+            ? await getReleaseSummary(container, {
+                  token: hass.github_token,
+                  log: this.log,
+              })
+            : undefined;
+
         this.log.debug(`Publish container result to ${containerTopic}`);
         return new Promise<void>((resolve, reject) => {
             this.client.publish(
                 containerTopic,
-                JSON.stringify(flatten(container)),
+                JSON.stringify({
+                    ...flatten(container),
+                    release_summary: releaseSummary,
+                }),
                 {
                     retain: true,
                 },
